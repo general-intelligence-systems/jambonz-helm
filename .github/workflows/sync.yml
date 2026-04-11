@@ -1,0 +1,88 @@
+name: Sync Upstream Chart
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # weekly on monday
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Upstream ref to sync (tag, branch, or SHA)"
+        default: "main"
+
+permissions:
+  contents: write
+  pages: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "$GITHUB_ACTOR"
+          git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+
+      - name: Clone upstream jambonz helm-chart
+        run: |
+          git clone --depth 1 \
+            --branch "${{ github.event.inputs.upstream_ref || 'main' }}" \
+            https://github.com/jambonz-selfhosting/helm-chart.git /tmp/helm-chart
+
+      - name: Sync chart into charts/jambonz
+        run: |
+          mkdir -p charts
+          rm -rf charts/jambonz
+          mkdir -p charts/jambonz
+          # Copy chart files (excluding git, docs, README, .gitignore)
+          cp -r /tmp/helm-chart/Chart.yaml charts/jambonz/
+          cp -r /tmp/helm-chart/values.yaml charts/jambonz/
+          cp -r /tmp/helm-chart/templates charts/jambonz/
+          [ -f /tmp/helm-chart/.helmignore ] && cp /tmp/helm-chart/.helmignore charts/jambonz/
+          [ -f /tmp/helm-chart/Chart.lock ] && cp /tmp/helm-chart/Chart.lock charts/jambonz/
+
+      - name: Record upstream version
+        run: |
+          cd /tmp/helm-chart
+          echo "$(git rev-parse HEAD) $(git describe --tags --always)" \
+            > "$GITHUB_WORKSPACE/charts/jambonz/.upstream-ref"
+
+      - name: Commit changes
+        id: commit
+        run: |
+          git add charts/
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No changes detected"
+          else
+            CHART_VERSION=$(grep '^version:' charts/jambonz/Chart.yaml | awk '{print $2}')
+            git commit -m "sync: jambonz chart ${CHART_VERSION}"
+            git push
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Tag release
+        if: steps.commit.outputs.changed == 'true'
+        run: |
+          CHART_VERSION=$(grep '^version:' charts/jambonz/Chart.yaml | awk '{print $2}')
+          TAG="v${CHART_VERSION}"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists, skipping"
+          else
+            git tag "$TAG"
+            git push origin "$TAG"
+            echo "Created and pushed tag $TAG"
+          fi
+
+      - name: Release charts
+        if: steps.commit.outputs.changed == 'true'
+        uses: helm/chart-releaser-action@v1.7.0
+        with:
+          charts_dir: charts
+          skip_existing: true
+        env:
+          CR_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
